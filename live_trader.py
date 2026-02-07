@@ -900,6 +900,195 @@ def create_app() -> "FastAPI":
 
         return result
 
+    # ── Public Activity Feed (for social media / marketing) ──────
+
+    @app.get("/public/feed")
+    def public_feed(limit: int = 10):
+        """
+        Public activity feed — formatted for social sharing.
+        Shows approved trades, blocked signals, and governance stats
+        WITHOUT exposing sensitive data (no balances, no exact amounts).
+        """
+        trader = get_trader()
+        entries = []
+
+        try:
+            with open("live_audit.jsonl", "r") as f:
+                for line in f:
+                    if line.strip():
+                        entries.append(json.loads(line.strip()))
+        except FileNotFoundError:
+            pass
+
+        feed = []
+        for entry in entries[-100:][::-1]:  # Last 100, newest first
+            event = entry.get("event", "")
+
+            if event == "TRADE_EXECUTED":
+                gov = entry.get("governance", {})
+                feed.append({
+                    "type": "trade_executed",
+                    "icon": "✅",
+                    "headline": "Agent placed a trade",
+                    "market": entry.get("signal", "")[:80],
+                    "direction": entry.get("direction", "").upper(),
+                    "ticker": entry.get("ticker", ""),
+                    "rules_checked": gov.get("rules_checked", 0),
+                    "rules_failed": gov.get("rules_failed", 0),
+                    "decision": "APPROVED",
+                    "timestamp": entry.get("_logged_at", ""),
+                })
+
+            elif event == "SIGNAL_BLOCKED":
+                gov = entry.get("governance", {})
+                blocking = entry.get("blocking_rules", [])
+                feed.append({
+                    "type": "signal_blocked",
+                    "icon": "🚫",
+                    "headline": "Guardrails blocked a trade",
+                    "market": entry.get("signal", "")[:80],
+                    "direction": entry.get("direction", "").upper(),
+                    "decision": entry.get("decision", "blocked").upper(),
+                    "blocked_by": blocking,
+                    "blocked_by_summary": ", ".join(blocking[:3]),
+                    "rules_checked": gov.get("rules_checked", 0),
+                    "timestamp": entry.get("_logged_at", ""),
+                })
+
+            elif event == "KILL_SWITCH_ACTIVATED":
+                feed.append({
+                    "type": "kill_switch",
+                    "icon": "🛑",
+                    "headline": "KILL SWITCH ACTIVATED",
+                    "reason": entry.get("reason", ""),
+                    "timestamp": entry.get("_logged_at", ""),
+                })
+
+            elif event == "RUN_COMPLETE":
+                summary = entry.get("summary", {})
+                if summary.get("matched", 0) > 0:
+                    feed.append({
+                        "type": "run_summary",
+                        "icon": "📊",
+                        "headline": "Trade cycle completed",
+                        "signals_found": summary.get("total", 0),
+                        "matched": summary.get("matched", 0),
+                        "approved": summary.get("approved", 0),
+                        "blocked": summary.get("blocked", 0),
+                        "executed": summary.get("executed", 0),
+                        "timestamp": entry.get("_logged_at", ""),
+                    })
+
+        # Stats summary
+        stats = trader.governance.get_stats()
+
+        return {
+            "feed": feed[:limit],
+            "summary": {
+                "total_signals_processed": stats["signals_processed"],
+                "total_approved": stats["approved"],
+                "total_blocked": stats["blocked"],
+                "approval_rate": f"{stats['approval_rate']:.0%}",
+                "kill_switch": "ACTIVE" if stats["kill_switch_active"] else "OFF",
+            },
+            "generated_at": datetime.datetime.utcnow().isoformat(),
+        }
+
+    @app.get("/public/tweet")
+    def generate_tweet():
+        """
+        Auto-generate a tweet from the latest trading activity.
+        Hit this endpoint -> copy -> paste to Twitter.
+        """
+        trader = get_trader()
+        entries = []
+
+        try:
+            with open("live_audit.jsonl", "r") as f:
+                for line in f:
+                    if line.strip():
+                        entries.append(json.loads(line.strip()))
+        except FileNotFoundError:
+            return {"tweets": [], "stats": {}, "note": "No activity yet."}
+
+        stats = trader.governance.get_stats()
+
+        # Count recent events
+        recent_trades = []
+        recent_blocks = []
+        for entry in entries[-20:][::-1]:
+            event = entry.get("event", "")
+            if event == "TRADE_EXECUTED":
+                recent_trades.append(entry)
+            elif event == "SIGNAL_BLOCKED":
+                recent_blocks.append(entry)
+
+        tweets = []
+
+        # Generate "daily recap" tweet
+        if recent_trades or recent_blocks:
+            lines = ["\U0001f510 AgentWallet Predictor \u2014 Daily Update\n"]
+
+            if recent_trades:
+                lines.append(f"\u2705 {len(recent_trades)} trade(s) approved and executed")
+                for t in recent_trades[:2]:
+                    direction = t.get("direction", "").upper()
+                    market = t.get("signal", "")[:50]
+                    lines.append(f'  \u2192 {direction} on "{market}"')
+
+            if recent_blocks:
+                lines.append(f"\n\U0001f6ab {len(recent_blocks)} signal(s) blocked by guardrails")
+                for b in recent_blocks[:2]:
+                    market = b.get("signal", "")[:50]
+                    rules = b.get("blocking_rules", [])
+                    rule_text = rules[0] if rules else "governance rules"
+                    lines.append(f'  \u2192 "{market}" blocked by {rule_text}')
+
+            lines.append(f"\n\U0001f4ca Lifetime: {stats['approved']} approved / {stats['blocked']} blocked")
+            lines.append(f"Approval rate: {stats['approval_rate']:.0%}")
+            lines.append("\nEvery trade goes through 11 governance rules before money moves.")
+            lines.append("\ngithub.com/JackD720/agentwallet")
+
+            tweet_text = "\n".join(lines)
+            tweets.append({
+                "type": "daily_recap",
+                "tweet": tweet_text,
+                "char_count": len(tweet_text),
+            })
+
+        # Generate "blocked trade spotlight" tweet
+        if recent_blocks:
+            block = recent_blocks[0]
+            market = block.get("signal", "")[:60]
+            rules = block.get("blocking_rules", [])
+
+            lines = [
+                f'Our AI agent wanted to trade on "{market}"\n',
+                "Our guardrails said no.\n",
+            ]
+            for rule in rules[:3]:
+                lines.append(f"\U0001f6ab Blocked by: {rule}")
+
+            lines.append("\nThis is why AI agents need governance \u2014 not just a credit card.")
+            lines.append("\nBuilding financial infrastructure for AI agents: github.com/JackD720/agentwallet")
+
+            tweet_text = "\n".join(lines)
+            tweets.append({
+                "type": "blocked_spotlight",
+                "tweet": tweet_text,
+                "char_count": len(tweet_text),
+            })
+
+        return {
+            "tweets": tweets,
+            "stats": {
+                "recent_trades": len(recent_trades),
+                "recent_blocks": len(recent_blocks),
+                "lifetime_approved": stats["approved"],
+                "lifetime_blocked": stats["blocked"],
+            }
+        }
+
     return app
 
 
