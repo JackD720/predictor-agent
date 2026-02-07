@@ -900,18 +900,11 @@ def create_app() -> "FastAPI":
 
         return result
 
-    # ── Public Activity Feed (for social media / marketing) ──────
+    # ── Helper: read audit log without needing trader ────────────
 
-    @app.get("/public/feed")
-    def public_feed(limit: int = 10):
-        """
-        Public activity feed — formatted for social sharing.
-        Shows approved trades, blocked signals, and governance stats
-        WITHOUT exposing sensitive data (no balances, no exact amounts).
-        """
-        trader = get_trader()
+    def _read_audit_entries():
+        """Read audit log entries directly from file. No trader needed."""
         entries = []
-
         try:
             with open("live_audit.jsonl", "r") as f:
                 for line in f:
@@ -919,12 +912,50 @@ def create_app() -> "FastAPI":
                         entries.append(json.loads(line.strip()))
         except FileNotFoundError:
             pass
+        return entries
+
+    def _compute_stats_from_entries(entries):
+        """Compute governance stats from audit log entries."""
+        total_approved = 0
+        total_blocked = 0
+        kill_switch_active = False
+
+        for entry in entries:
+            event = entry.get("event", "")
+            if event == "TRADE_EXECUTED" or event == "DRY_RUN_APPROVED":
+                total_approved += 1
+            elif event == "SIGNAL_BLOCKED":
+                total_blocked += 1
+            elif event == "KILL_SWITCH_ACTIVATED":
+                kill_switch_active = True
+            elif event == "KILL_SWITCH_RESET":
+                kill_switch_active = False
+
+        total = total_approved + total_blocked
+        approval_rate = total_approved / total if total > 0 else 0
+        return {
+            "signals_processed": total,
+            "approved": total_approved,
+            "blocked": total_blocked,
+            "approval_rate": approval_rate,
+            "kill_switch_active": kill_switch_active,
+        }
+
+    # ── Public Activity Feed (for social media / marketing) ──────
+
+    @app.get("/public/feed")
+    def public_feed(limit: int = 10):
+        """
+        Public activity feed — formatted for social sharing.
+        Reads directly from audit log — does NOT require trader to be running.
+        """
+        entries = _read_audit_entries()
 
         feed = []
         for entry in entries[-100:][::-1]:  # Last 100, newest first
             event = entry.get("event", "")
 
-            if event == "TRADE_EXECUTED":
+            if event == "TRADE_EXECUTED" or event == "DRY_RUN_APPROVED":
                 gov = entry.get("governance", {})
                 feed.append({
                     "type": "trade_executed",
@@ -979,8 +1010,7 @@ def create_app() -> "FastAPI":
                         "timestamp": entry.get("_logged_at", ""),
                     })
 
-        # Stats summary
-        stats = trader.governance.get_stats()
+        stats = _compute_stats_from_entries(entries)
 
         return {
             "feed": feed[:limit],
@@ -998,27 +1028,20 @@ def create_app() -> "FastAPI":
     def generate_tweet():
         """
         Auto-generate a tweet from the latest trading activity.
-        Hit this endpoint -> copy -> paste to Twitter.
+        Reads directly from audit log — does NOT require trader to be running.
         """
-        trader = get_trader()
-        entries = []
-
-        try:
-            with open("live_audit.jsonl", "r") as f:
-                for line in f:
-                    if line.strip():
-                        entries.append(json.loads(line.strip()))
-        except FileNotFoundError:
+        entries = _read_audit_entries()
+        if not entries:
             return {"tweets": [], "stats": {}, "note": "No activity yet."}
 
-        stats = trader.governance.get_stats()
+        stats = _compute_stats_from_entries(entries)
 
         # Count recent events
         recent_trades = []
         recent_blocks = []
         for entry in entries[-20:][::-1]:
             event = entry.get("event", "")
-            if event == "TRADE_EXECUTED":
+            if event == "TRADE_EXECUTED" or event == "DRY_RUN_APPROVED":
                 recent_trades.append(entry)
             elif event == "SIGNAL_BLOCKED":
                 recent_blocks.append(entry)
@@ -1045,7 +1068,8 @@ def create_app() -> "FastAPI":
                     lines.append(f'  \u2192 "{market}" blocked by {rule_text}')
 
             lines.append(f"\n\U0001f4ca Lifetime: {stats['approved']} approved / {stats['blocked']} blocked")
-            lines.append(f"Approval rate: {stats['approval_rate']:.0%}")
+            rate_pct = f"{stats['approval_rate']:.0%}"
+            lines.append(f"Approval rate: {rate_pct}")
             lines.append("\nEvery trade goes through 11 governance rules before money moves.")
             lines.append("\ngithub.com/JackD720/agentwallet")
 
