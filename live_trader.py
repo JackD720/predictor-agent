@@ -864,6 +864,57 @@ def create_app() -> "FastAPI":
         # Return last 50 entries, newest first
         return {"entries": entries[-50:][::-1], "total": len(entries)}
 
+    # Cache for /api/signals
+    _signal_cache = {"signals": [], "last_updated": None, "cache_minutes": 5}
+
+    @app.get("/api/signals")
+    def api_signals(refresh: bool = False):
+        """
+        Serve trading signals from the same Polymarket pipeline the trader uses.
+        Cached for 5 minutes to avoid hammering Polymarket.
+        """
+        import datetime as _dt
+
+        now = _dt.datetime.utcnow()
+
+        # Return cache if fresh
+        if not refresh and _signal_cache["last_updated"]:
+            age = (now - _signal_cache["last_updated"]).total_seconds() / 60
+            if age < _signal_cache["cache_minutes"] and _signal_cache["signals"]:
+                return {"signals": _signal_cache["signals"], "cached": True, "age_minutes": round(age, 1)}
+
+        # Generate fresh signals
+        trader = get_trader()
+        try:
+            raw = trader.fetch_signals()
+            signals = []
+            for i, sig in enumerate(raw):
+                signals.append({
+                    "id": f"sig_{i}_{sig.market_slug[:20]}",
+                    "market_slug": sig.market_slug,
+                    "market_title": sig.market_title,
+                    "direction": sig.direction,
+                    "conviction": sig.conviction,
+                    "num_traders": sig.num_traders,
+                    "total_size": sig.total_size,
+                    "avg_entry_price": sig.avg_entry_price,
+                    "current_price": sig.current_price,
+                    "expected_edge": sig.expected_edge,
+                    "ars_score": sig.ars_score,
+                    "recommended_size": sig.recommended_size,
+                    "entry_quality": sig.entry_quality,
+                    "traders": sig.traders[:10],
+                    "category": "Prediction",
+                })
+            _signal_cache["signals"] = signals
+            _signal_cache["last_updated"] = now
+            return {"signals": signals, "cached": False, "total": len(signals)}
+        except Exception as e:
+            # Return stale cache if available
+            if _signal_cache["signals"]:
+                return {"signals": _signal_cache["signals"], "cached": True, "stale": True, "error": str(e)}
+            return {"signals": [], "error": str(e)}
+
     @app.get("/dashboard")
     def dashboard():
         """All-in-one dashboard data endpoint."""
