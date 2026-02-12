@@ -292,12 +292,6 @@ class MarketMatcher:
         best_score = 0
 
         for market in self.kalshi_markets:
-            # Skip combo/multi-game/parlay markets — these are multi-leg bets
-            # that require ALL outcomes to hit. Our signals are single-game.
-            ticker_str = market.get("ticker", "").upper()
-            if "MULTIGAME" in ticker_str or "EXTENDED" in ticker_str or "COMBO" in ticker_str or "PARLAY" in ticker_str:
-                continue
-
             title_lower = (market.get("title", "") + " " + market.get("subtitle", "")).lower()
             event_ticker = market.get("event_ticker", "").lower()
             category = market.get("category", "").lower()
@@ -532,51 +526,67 @@ class LiveTrader:
 
             results["matched"] += 1
 
-            # Step 1b: If price is 0, this is likely a multi-game container.
-            # Find the actual tradeable winner/moneyline market under this event.
+            # Step 1b: Resolve to a single-game market.
+            # If matched market is a multi-game combo or has no price,
+            # search the event for the actual single-game winner market.
             ticker = kalshi_match["ticker"]
             yes_price = kalshi_match["yes_price"]
             no_price = kalshi_match["no_price"]
+            ticker_upper = ticker.upper()
+            is_combo = any(k in ticker_upper for k in ["MULTIGAME", "EXTENDED", "COMBO", "PARLAY"])
 
-            if yes_price == 0 and no_price == 0 and kalshi_match.get("event_ticker"):
-                print(f"   🔍 Container market — searching event for tradeable market...")
+            if (is_combo or (yes_price == 0 and no_price == 0)) and kalshi_match.get("event_ticker"):
+                print(f"   🔍 {'Combo' if is_combo else 'Container'} market — searching for single-game market...")
+                found_single = False
                 try:
                     event_markets = self.kalshi.get_event_markets(kalshi_match["event_ticker"])
-                    # Find simple winner/moneyline markets (not O/U, not props)
                     for em in event_markets:
+                        em_ticker = em.get("ticker", "").upper()
                         em_title = (em.get("title", "") + " " + em.get("subtitle", "")).lower()
                         em_yes = em.get("yes_price", 0)
                         em_no = em.get("no_price", 0)
-                        # Skip markets with 0 prices or that look like props/O-U
+
+                        # Skip combo/multi-game markets
+                        if any(k in em_ticker for k in ["MULTIGAME", "EXTENDED", "COMBO", "PARLAY"]):
+                            continue
+                        # Skip markets with 0 prices
                         if em_yes == 0 and em_no == 0:
                             continue
-                        if "over" in em_title or "under" in em_title or "points" in em_title:
+                        # Skip props/O-U/spread (we want winner/moneyline)
+                        if any(w in em_title for w in ["over", "under", "points", "spread", "total"]):
                             continue
-                        # This is a tradeable market with real prices
+
+                        # Found a single-game market with real prices
                         ticker = em.get("ticker", ticker)
                         yes_price = em_yes
                         no_price = em_no
                         kalshi_match["title"] = em.get("title", kalshi_match["title"])
-                        print(f"   ✅ Found tradeable: {ticker}")
+                        found_single = True
+                        print(f"   ✅ Found single-game: {ticker}")
                         print(f"      {em.get('title', '')}")
                         break
 
-                    # If still no price, try fetching orderbook on original ticker
-                    if yes_price == 0 and no_price == 0:
-                        try:
-                            ob = self.kalshi.get_orderbook(kalshi_match["ticker"])
-                            orderbook = ob.get("orderbook", {})
-                            yes_bids = orderbook.get("yes", [])
-                            no_bids = orderbook.get("no", [])
-                            if yes_bids:
-                                yes_price = yes_bids[0][0] if isinstance(yes_bids[0], list) else yes_bids[0]
-                            if no_bids:
-                                no_price = no_bids[0][0] if isinstance(no_bids[0], list) else no_bids[0]
-                        except Exception:
-                            pass
-
                 except Exception as e:
                     print(f"   ⚠️  Event lookup failed: {e}")
+
+                # If this was a combo and we couldn't find a single-game alternative, skip it
+                if is_combo and not found_single:
+                    print(f"   ⚪ Combo market with no single-game alternative — skipping")
+                    continue
+
+                # If still no price on a non-combo container, try orderbook
+                if not found_single and yes_price == 0 and no_price == 0:
+                    try:
+                        ob = self.kalshi.get_orderbook(kalshi_match["ticker"])
+                        orderbook = ob.get("orderbook", {})
+                        yes_bids = orderbook.get("yes", [])
+                        no_bids = orderbook.get("no", [])
+                        if yes_bids:
+                            yes_price = yes_bids[0][0] if isinstance(yes_bids[0], list) else yes_bids[0]
+                        if no_bids:
+                            no_price = no_bids[0][0] if isinstance(no_bids[0], list) else no_bids[0]
+                    except Exception:
+                        pass
 
             # Skip if we still can't get a price
             if yes_price == 0 and no_price == 0:
