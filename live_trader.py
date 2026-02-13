@@ -290,6 +290,7 @@ class MarketMatcher:
 
         best_match = None
         best_score = 0
+        best_combo = None  # Track best combo as fallback for logging
 
         for market in self.kalshi_markets:
             title_lower = (market.get("title", "") + " " + market.get("subtitle", "")).lower()
@@ -330,6 +331,20 @@ class MarketMatcher:
 
                 score = max(score, kw_score)
 
+            # Penalize combo/multi-game markets heavily.
+            # Our signals are single-game predictions — combos require ALL legs to hit.
+            ticker_upper = market.get("ticker", "").upper()
+            is_combo = any(k in ticker_upper for k in ["MULTIGAME", "EXTENDED", "COMBO", "PARLAY"])
+            if is_combo and score > 0:
+                # Track best combo before penalizing (for debug logging)
+                if score > (best_combo or {}).get("match_score", 0):
+                    best_combo = {
+                        "ticker": market.get("ticker", ""),
+                        "title": market.get("title", ""),
+                        "match_score": round(score, 2),
+                    }
+                score *= 0.3  # Heavy penalty — prefer single-game markets
+
             # Must meet minimum threshold
             if score > best_score and score >= 0.4:
                 best_score = score
@@ -344,6 +359,15 @@ class MarketMatcher:
                     "category": market.get("category", ""),
                     "event_ticker": market.get("event_ticker", ""),
                 }
+
+        # Debug: log what we found
+        if best_match:
+            print(f"      🎯 Matched: {best_match['ticker'][:40]} (score: {best_match['match_score']})")
+        elif best_combo:
+            print(f"      ⚠️  Only combo found: {best_combo['ticker'][:40]} (pre-penalty: {best_combo['match_score']})")
+            print(f"         No single-game market available on Kalshi for this matchup")
+        else:
+            print(f"      ❌ No match found in {len(self.kalshi_markets)} markets")
 
         return best_match
 
@@ -412,24 +436,39 @@ class LiveTrader:
             pk_pem = b64mod.b64decode(pk_b64).decode("utf-8")
 
         if not api_key:
-            print("❌ Set KALSHI_API_KEY_ID environment variable")
-            sys.exit(1)
+            print("⚠️ KALSHI_API_KEY_ID not set — trading disabled, signals-only mode")
+            self.kalshi = None
+            self.kalshi_available = False
+        else:
+            try:
+                self.kalshi = KalshiAuthClient(
+                    api_key_id=api_key,
+                    private_key_path=pk_path if not pk_pem else None,
+                    private_key_pem=pk_pem,
+                )
 
-        self.kalshi = KalshiAuthClient(
-            api_key_id=api_key,
-            private_key_path=pk_path if not pk_pem else None,
-            private_key_pem=pk_pem,
-        )
+                # ── Get real balance ──
+                balance_data = self.kalshi.get_balance()
+                real_balance_cents = balance_data.get("balance", 0)
+                real_balance = real_balance_cents / 100
+                print(f"\n💰 Kalshi Balance: ${real_balance:.2f}")
 
-        # ── Get real balance ──
-        balance_data = self.kalshi.get_balance()
-        real_balance_cents = balance_data.get("balance", 0)
-        real_balance = real_balance_cents / 100
-        print(f"\n💰 Kalshi Balance: ${real_balance:.2f}")
+                if real_balance < 1:
+                    print("⚠️ Balance too low to trade — signals-only mode")
+                    self.kalshi_available = False
+                else:
+                    self.kalshi_available = True
+            except Exception as e:
+                print(f"⚠️ Kalshi auth failed: {e} — signals-only mode")
+                self.kalshi = None
+                self.kalshi_available = False
 
-        if real_balance < 1:
-            print("❌ Balance too low to trade. Deposit funds first.")
-            sys.exit(1)
+        # ── Set balance (real or default) ──
+        if self.kalshi_available:
+            pass  # real_balance already set above
+        else:
+            real_balance = 0
+            real_balance_cents = 0
 
         # ── Governance Engine (tuned for real balance) ──
         self.governance = GovernanceEngine({
@@ -449,7 +488,7 @@ class LiveTrader:
         })
 
         # ── Market Matcher ──
-        self.matcher = MarketMatcher(self.kalshi)
+        self.matcher = MarketMatcher(self.kalshi) if self.kalshi_available else None
 
         # ── Signal Generator ──
         self.signal_gen = SignalGenerator()
@@ -498,6 +537,10 @@ class LiveTrader:
 
     def run_pipeline(self, signals: List) -> Dict[str, Any]:
         """Run the full governance → execution pipeline."""
+        if not self.kalshi_available:
+            print("⚠️ Kalshi not available — cannot execute trades")
+            return {"total": len(signals), "matched": 0, "approved": 0, "blocked": 0, "executed": 0, "errors": 0, "trades": [], "error": "kalshi_auth_failed"}
+
         print("\n" + "=" * 60)
         print("🔐 GOVERNANCE PIPELINE")
         print("=" * 60)
@@ -870,7 +913,8 @@ def create_app() -> "FastAPI":
     @app.get("/api/signals")
     def api_signals(refresh: bool = False):
         """
-        Serve trading signals from the same Polymarket pipeline the trader uses.
+        Serve trading signals from Polymarket pipeline.
+        Independent of Kalshi auth — signals come from Polymarket only.
         Cached for 5 minutes to avoid hammering Polymarket.
         """
         import datetime as _dt
@@ -883,12 +927,22 @@ def create_app() -> "FastAPI":
             if age < _signal_cache["cache_minutes"] and _signal_cache["signals"]:
                 return {"signals": _signal_cache["signals"], "cached": True, "age_minutes": round(age, 1)}
 
-        # Generate fresh signals
-        trader = get_trader()
+        # Generate fresh signals using standalone Polymarket pipeline
         try:
-            raw = trader.fetch_signals()
+            from polymarket import PolymarketClient
+            from signals import SignalGenerator
+
+            pm_client = PolymarketClient()
+            sig_gen = SignalGenerator(pm_client)
+            sig_gen.fetch_top_traders(limit=30)
+            sig_gen.score_traders(min_pnl=5000)
+            sig_gen.fetch_positions(top_n=15)
+            raw = sig_gen.aggregate_signals(min_traders=2, min_conviction=0.05)
+            raw = sig_gen.filter_resolved_markets(raw)
+            scored = sig_gen.apply_ars_scoring(raw)
+
             signals = []
-            for i, sig in enumerate(raw):
+            for i, sig in enumerate(scored):
                 signals.append({
                     "id": f"sig_{i}_{sig.market_slug[:20]}",
                     "market_slug": sig.market_slug,
@@ -900,9 +954,9 @@ def create_app() -> "FastAPI":
                     "avg_entry_price": sig.avg_entry_price,
                     "current_price": sig.current_price,
                     "expected_edge": sig.expected_edge,
-                    "ars_score": sig.ars_score,
-                    "recommended_size": sig.recommended_size,
-                    "entry_quality": sig.entry_quality,
+                    "ars_score": getattr(sig, 'ars_score', 0),
+                    "recommended_size": getattr(sig, 'recommended_size', 0),
+                    "entry_quality": getattr(sig, 'entry_quality', 'unknown'),
                     "traders": sig.traders[:10],
                     "category": "Prediction",
                 })
@@ -910,6 +964,8 @@ def create_app() -> "FastAPI":
             _signal_cache["last_updated"] = now
             return {"signals": signals, "cached": False, "total": len(signals)}
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             # Return stale cache if available
             if _signal_cache["signals"]:
                 return {"signals": _signal_cache["signals"], "cached": True, "stale": True, "error": str(e)}
