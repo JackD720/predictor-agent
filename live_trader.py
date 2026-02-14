@@ -819,12 +819,19 @@ def create_app() -> "FastAPI":
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
     # Lazy-init trader (created on first request)
-    _trader = {"instance": None}
+    _trader = {"instance": None, "last_init_attempt": 0}
 
     def get_trader(dry_run: bool = False) -> LiveTrader:
-        if _trader["instance"] is None:
+        import time
+        now = time.time()
+        needs_init = _trader["instance"] is None
+        # Retry Kalshi connection every 5 minutes if it was unavailable
+        if _trader["instance"] and not _trader["instance"].kalshi_available and (now - _trader["last_init_attempt"]) > 300:
+            needs_init = True
+        if needs_init:
             mode = os.environ.get("TRADER_MODE", "live")
             _trader["instance"] = LiveTrader(dry_run=(mode == "dry-run" or dry_run))
+            _trader["last_init_attempt"] = now
         return _trader["instance"]
 
     @app.get("/health")
@@ -929,11 +936,9 @@ def create_app() -> "FastAPI":
 
         # Generate fresh signals using standalone Polymarket pipeline
         try:
-            from polymarket import PolymarketClient
             from signals import SignalGenerator
 
-            pm_client = PolymarketClient()
-            sig_gen = SignalGenerator(pm_client)
+            sig_gen = SignalGenerator()
             sig_gen.fetch_top_traders(limit=30)
             sig_gen.score_traders(min_pnl=5000)
             sig_gen.fetch_positions(top_n=15)
