@@ -819,29 +819,48 @@ def create_app() -> "FastAPI":
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
     # Lazy-init trader (created on first request)
-    _trader = {"instance": None, "last_init_attempt": 0}
+    _trader = {"instance": None, "last_init_attempt": 0, "init_error": None}
 
-    def get_trader(dry_run: bool = False) -> LiveTrader:
+    def get_trader(dry_run: bool = False) -> Optional[LiveTrader]:
         import time
         now = time.time()
         needs_init = _trader["instance"] is None
         # Retry Kalshi connection every 5 minutes if it was unavailable
         if _trader["instance"] and not _trader["instance"].kalshi_available and (now - _trader["last_init_attempt"]) > 300:
             needs_init = True
+        # Also retry if last init failed (every 60 seconds)
+        if _trader["instance"] is None and _trader["init_error"] and (now - _trader["last_init_attempt"]) < 60:
+            return None  # Don't spam retries
         if needs_init:
-            mode = os.environ.get("TRADER_MODE", "live")
-            _trader["instance"] = LiveTrader(dry_run=(mode == "dry-run" or dry_run))
+            try:
+                mode = os.environ.get("TRADER_MODE", "live")
+                _trader["instance"] = LiveTrader(dry_run=(mode == "dry-run" or dry_run))
+                _trader["init_error"] = None
+            except Exception as e:
+                print(f"❌ LiveTrader init failed: {e}")
+                _trader["instance"] = None
+                _trader["init_error"] = str(e)
             _trader["last_init_attempt"] = now
         return _trader["instance"]
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "service": "agentwallet-live-trader", "timestamp": datetime.datetime.utcnow().isoformat()}
+        trader = _trader.get("instance")
+        return {
+            "status": "ok",
+            "service": "agentwallet-live-trader",
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "trader_initialized": trader is not None,
+            "kalshi_connected": trader.kalshi_available if trader else False,
+            "init_error": _trader.get("init_error"),
+        }
 
     @app.post("/run")
     def run_trade():
         """Trigger a single trading run. Called by Cloud Scheduler."""
         trader = get_trader()
+        if not trader:
+            return {"status": "error", "error": "Trader not initialized"}
         try:
             results = trader.run_once()
             return {"status": "ok", "results": results}
@@ -852,6 +871,8 @@ def create_app() -> "FastAPI":
     def stats():
         """Get governance engine stats."""
         trader = get_trader()
+        if not trader:
+            return {"governance": {"signals_processed": 0, "approved": 0, "blocked": 0}, "dry_run": False, "audit_entries": 0}
         return {
             "governance": trader.governance.get_stats(),
             "dry_run": trader.dry_run,
@@ -862,6 +883,8 @@ def create_app() -> "FastAPI":
     def balance():
         """Check real Kalshi balance."""
         trader = get_trader()
+        if not trader or not trader.kalshi or not trader.kalshi_available:
+            return {"error": "Kalshi not connected", "balance_cents": 0, "balance_usd": 0}
         try:
             bal = trader.kalshi.get_balance()
             return {"balance_cents": bal.get("balance", 0), "balance_usd": bal.get("balance", 0) / 100}
@@ -872,6 +895,8 @@ def create_app() -> "FastAPI":
     def kill_switch(activate: bool = True, reason: str = "manual"):
         """Activate or deactivate the kill switch."""
         trader = get_trader()
+        if not trader:
+            return {"error": "Trader not initialized"}
         if activate:
             trader.governance.activate_kill_switch(reason)
             return {"status": "kill_switch_activated", "reason": reason}
@@ -883,6 +908,8 @@ def create_app() -> "FastAPI":
     def positions():
         """Get current Kalshi positions."""
         trader = get_trader()
+        if not trader or not trader.kalshi or not trader.kalshi_available:
+            return {"market_positions": [], "error": "Kalshi not connected"}
         try:
             pos = trader.kalshi.get_positions()
             return pos
@@ -893,6 +920,8 @@ def create_app() -> "FastAPI":
     def trades():
         """Get recent fills/trades from Kalshi."""
         trader = get_trader()
+        if not trader or not trader.kalshi or not trader.kalshi_available:
+            return {"fills": [], "error": "Kalshi not connected"}
         try:
             data = trader.kalshi._request("GET", "/trade-api/v2/portfolio/fills", params={"limit": 20})
             return data
@@ -902,7 +931,6 @@ def create_app() -> "FastAPI":
     @app.get("/audit")
     def audit():
         """Get recent audit entries."""
-        trader = get_trader()
         entries = []
         try:
             with open("live_audit.jsonl", "r") as f:
@@ -980,24 +1008,48 @@ def create_app() -> "FastAPI":
     def dashboard():
         """All-in-one dashboard data endpoint."""
         trader = get_trader()
+
+        # If trader couldn't initialize at all, return a useful error state
+        if trader is None:
+            return {
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "dry_run": False,
+                "status": "initializing",
+                "init_error": _trader.get("init_error", "Trader initializing..."),
+                "balance": {"cents": 0, "usd": 0, "error": "Trader not initialized"},
+                "positions": {"market_positions": [], "error": "Trader not initialized"},
+                "governance": {"signals_processed": 0, "approved": 0, "blocked": 0, "approval_rate": 0, "kill_switch_active": False},
+                "recent_fills": {"fills": []},
+                "audit_count": 0,
+                "last_run": None,
+            }
+
         result = {
             "timestamp": datetime.datetime.utcnow().isoformat(),
             "dry_run": trader.dry_run,
+            "status": "connected" if trader.kalshi_available else "degraded",
+            "kalshi_connected": trader.kalshi_available,
         }
 
-        # Balance
-        try:
-            bal = trader.kalshi.get_balance()
-            result["balance"] = {"cents": bal.get("balance", 0), "usd": bal.get("balance", 0) / 100}
-        except Exception as e:
-            result["balance"] = {"error": str(e)}
+        # Balance — only if Kalshi is available
+        if trader.kalshi and trader.kalshi_available:
+            try:
+                bal = trader.kalshi.get_balance()
+                result["balance"] = {"cents": bal.get("balance", 0), "usd": bal.get("balance", 0) / 100}
+            except Exception as e:
+                result["balance"] = {"cents": 0, "usd": 0, "error": str(e)}
+        else:
+            result["balance"] = {"cents": 0, "usd": 0, "error": "Kalshi not connected"}
 
-        # Positions
-        try:
-            pos = trader.kalshi.get_positions()
-            result["positions"] = pos
-        except Exception as e:
-            result["positions"] = {"error": str(e)}
+        # Positions — only if Kalshi is available
+        if trader.kalshi and trader.kalshi_available:
+            try:
+                pos = trader.kalshi.get_positions()
+                result["positions"] = pos
+            except Exception as e:
+                result["positions"] = {"error": str(e)}
+        else:
+            result["positions"] = {"market_positions": [], "error": "Kalshi not connected"}
 
         # Governance stats
         try:
@@ -1006,12 +1058,15 @@ def create_app() -> "FastAPI":
         except Exception as e:
             result["governance"] = {"error": str(e)}
 
-        # Recent fills
-        try:
-            fills = trader.kalshi._request("GET", "/trade-api/v2/portfolio/fills", params={"limit": 10})
-            result["recent_fills"] = fills
-        except Exception as e:
-            result["recent_fills"] = {"error": str(e)}
+        # Recent fills — only if Kalshi is available
+        if trader.kalshi and trader.kalshi_available:
+            try:
+                fills = trader.kalshi._request("GET", "/trade-api/v2/portfolio/fills", params={"limit": 10})
+                result["recent_fills"] = fills
+            except Exception as e:
+                result["recent_fills"] = {"error": str(e)}
+        else:
+            result["recent_fills"] = {"fills": [], "error": "Kalshi not connected"}
 
         # Audit summary
         try:
@@ -1047,6 +1102,9 @@ def create_app() -> "FastAPI":
                         entries.append(json.loads(line.strip()))
         except FileNotFoundError:
             pass
+
+        if not entries:
+            return {"feed": [], "summary": {"total_signals_processed": 0, "total_approved": 0, "total_blocked": 0, "approval_rate": "0%", "kill_switch": "OFF"}, "generated_at": datetime.datetime.utcnow().isoformat()}
 
         feed = []
         for entry in entries[-100:][::-1]:  # Last 100, newest first
@@ -1108,7 +1166,20 @@ def create_app() -> "FastAPI":
                     })
 
         # Stats summary
-        stats = trader.governance.get_stats()
+        if trader:
+            stats = trader.governance.get_stats()
+        else:
+            # Calculate from audit entries directly
+            approved = sum(1 for e in entries if e.get("event") == "TRADE_EXECUTED")
+            blocked = sum(1 for e in entries if e.get("event") == "SIGNAL_BLOCKED")
+            total = approved + blocked
+            stats = {
+                "signals_processed": total,
+                "approved": approved,
+                "blocked": blocked,
+                "approval_rate": approved / total if total > 0 else 0,
+                "kill_switch_active": False,
+            }
 
         return {
             "feed": feed[:limit],
@@ -1139,7 +1210,22 @@ def create_app() -> "FastAPI":
         except FileNotFoundError:
             return {"tweets": [], "stats": {}, "note": "No activity yet."}
 
-        stats = trader.governance.get_stats()
+        if not entries:
+            return {"tweets": [], "stats": {}, "note": "No activity yet."}
+
+        if trader:
+            stats = trader.governance.get_stats()
+        else:
+            approved = sum(1 for e in entries if e.get("event") == "TRADE_EXECUTED")
+            blocked = sum(1 for e in entries if e.get("event") == "SIGNAL_BLOCKED")
+            total = approved + blocked
+            stats = {
+                "signals_processed": total,
+                "approved": approved,
+                "blocked": blocked,
+                "approval_rate": approved / total if total > 0 else 0,
+                "kill_switch_active": False,
+            }
 
         # Count recent events
         recent_trades = []
