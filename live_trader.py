@@ -48,7 +48,7 @@ except ImportError:
 class KalshiAuthClient:
     """Authenticated Kalshi client for real order placement."""
 
-    BASE_URL = "https://trading-api.kalshi.com"
+    BASE_URL = "https://api.elections.kalshi.com"
 
     def __init__(self, api_key_id: str, private_key_path: str = None, private_key_pem: str = None):
         self.api_key_id = api_key_id
